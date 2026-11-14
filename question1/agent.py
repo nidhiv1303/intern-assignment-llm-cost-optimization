@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import re
-import uuid
 from dataclasses import dataclass
 
 from shared.billing import CostSession
@@ -32,23 +31,28 @@ def parse_resolution(text: str) -> TicketResolution:
     )
 
 
-_FEW_SHOT = """
-Example ticket resolutions (format to copy):
+_RULES = (
+    "You are ShopAssist, the Tier-1 customer support copilot. "
+    "Choose exactly one action: REFUND, REPLACE, SEND_ARTICLE or ESCALATE_TIER2, "
+    "and cite the single help-center article id that supports it. "
+    'Reply with compact JSON only, no other text: {"action":"...","kb_article":"..."}'
+)
 
-1. Unopened headphones, day 10 → {"action":"REFUND","kb_article":"returns-within-30-days"}
-2. Ebook, license shown → {"action":"SEND_ARTICLE","kb_article":"digital-license-no-refund"}
-3. Cracked custom mug → {"action":"ESCALATE_TIER2","kb_article":"custom-items-no-replace"}
-4. Cracked stock mug, day 2 → {"action":"REPLACE","kb_article":"damage-replacement-7-days"}
-"""
+_FEW_SHOT = """Examples (format to copy):
+1. Unopened headphones, day 10 -> {"action":"REFUND","kb_article":"returns-within-30-days"}
+2. Ebook, license shown -> {"action":"SEND_ARTICLE","kb_article":"digital-license-no-refund"}
+3. Cracked custom mug -> {"action":"ESCALATE_TIER2","kb_article":"custom-items-no-replace"}
+4. Cracked stock mug, day 2 -> {"action":"REPLACE","kb_article":"damage-replacement-7-days"}"""
+
+# Static prefix: identical on every call, so it can be cached.
+# No per-call values (no uuid, no ticket data) may appear in it.
+_STATIC_SYSTEM = "\n\n".join(
+    [_RULES, _FEW_SHOT, "HELP CENTER:", all_articles_blob()]
+)
 
 
 class SupportCopilot:
-    """
-    ShopAssist Tier-1 copilot (baseline).
-
-    Given a support ticket + order snapshot, choose an action, cite the help-center
-    article, and draft the customer reply.
-    """
+    """ShopAssist Tier-1 copilot: one LLM call per ticket, cache-friendly prompt."""
 
     def __init__(self, session: CostSession | None = None):
         self.session = session or CostSession()
@@ -57,32 +61,16 @@ class SupportCopilot:
     def build_messages(self, ticket_id: str) -> list[ChatMessage]:
         ticket = get_ticket(ticket_id)
         order = get_order(ticket["order_id"])
-        thread = format_thread(ticket)
-        snapshot = json.dumps(order, indent=2)
-
-        system = "\n\n".join(
-            [
-                f"Run id {uuid.uuid4()}",
-                "You are ShopAssist, the Tier-1 customer support copilot.",
-                _FEW_SHOT,
-                "HELP CENTER:",
-                all_articles_blob(),
-                (
-                    "Instructions: Think step by step. Write full reasoning, quote any article "
-                    "you rely on, then output JSON with action, kb_article, customer_reply."
-                ),
-            ]
+        snapshot = json.dumps(order, separators=(",", ":"))
+        user = (
+            f"THREAD:\n{format_thread(ticket)}\n\n"
+            f"ORDER_SNAPSHOT:\n{snapshot}\nEND_SNAPSHOT"
         )
-        user = "\n\n".join(
-            [
-                f"TICKET_ID: {ticket_id}",
-                f"THREAD:\n{thread}",
-                f"ORDER_SNAPSHOT:\n{snapshot}\nEND_SNAPSHOT",
-            ]
-        )
-        return [ChatMessage("system", system), ChatMessage("user", user)]
+        return [ChatMessage("system", _STATIC_SYSTEM), ChatMessage("user", user)]
 
     def handle_ticket(self, ticket_id: str) -> TicketResolution:
         messages = self.build_messages(ticket_id)
-        completion = self.llm.chat("handle_ticket", messages)
+        # llm.py builds the prompt as "SYSTEM:\n<content>\n\nUSER:\n..."
+        prefix = "SYSTEM:\n" + messages[0].content
+        completion = self.llm.chat("handle_ticket", messages, cached_prefix=prefix)
         return parse_resolution(completion)
